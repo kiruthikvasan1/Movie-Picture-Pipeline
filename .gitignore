@@ -1,0 +1,10 @@
+node_modules/
+build/
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+.terraform/
+*.tfstate
+*.tfstate.*
