@@ -2,9 +2,12 @@ name: Backend Continuous Deployment
 
 on:
   push:
-    branches:
-      - main
-  workflow_dispatch:
+    branches: [main]
+    paths:
+      - "starter/backend/**"
+      - ".github/workflows/backend-cd.yaml"
+      - ".github/actions/setup-backend/**"
+  workflow_dispatch: {}
 
 jobs:
   lint:
@@ -14,17 +17,8 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Install Pipenv
-        run: pip install pipenv
-
-      - name: Install dependencies
-        working-directory: starter/backend
-        run: pipenv install --dev
+      - name: Setup backend environment
+        uses: ./.github/actions/setup-backend
 
       - name: Run lint
         working-directory: starter/backend
@@ -38,18 +32,90 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Install Pipenv
-        run: pip install pipenv
-
-      - name: Install dependencies
-        working-directory: starter/backend
-        run: pipenv install --dev
+      - name: Setup backend environment
+        uses: ./.github/actions/setup-backend
 
       - name: Run tests
         working-directory: starter/backend
         run: pipenv run test
+
+  build:
+    name: Build
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup backend environment
+        uses: ./.github/actions/setup-backend
+
+      - name: Set image tag
+        id: meta
+        run: echo "image_tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build Docker image
+        working-directory: starter/backend
+        run: docker build --tag backend:${{ github.sha }} .
+
+      - name: Save image as artifact
+        run: docker save backend:${{ github.sha }} -o /tmp/backend.tar
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-image-${{ github.sha }}
+          path: /tmp/backend.tar
+          retention-days: 1
+
+  deploy:
+    name: Deploy to EKS
+    needs: [lint, test, build]
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECR_REPOSITORY: backend
+      EKS_CLUSTER_NAME: cluster
+      IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Configure kubectl
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
+
+      - name: Download backend image
+        uses: actions/download-artifact@v4
+        with:
+          name: backend-image-${{ needs.build.outputs.image_tag }}
+          path: /tmp/backend-image
+
+      - name: Push backend image to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          docker load --input /tmp/backend-image/backend.tar
+          docker tag "backend:$IMAGE_TAG" "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker push "$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+      - name: Deploy backend
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          kubectl set image deployment/backend \
+            backend="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          kubectl rollout status deployment/backend --timeout=180s
